@@ -1,4 +1,4 @@
-import { RegistryContext, RegistryProvider, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
+import { RegistryContext, RegistryProvider, useAtomSuspense, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
 import * as Atom from "@effect-atom/atom/Atom"
 import * as AtomResult from "@effect-atom/atom/Result"
 import * as React from "react"
@@ -38,6 +38,17 @@ export interface UseQueryResult<A, E> {
   readonly refetch: () => void
 }
 
+export interface UseSuspenseQueryOptions<A, E, R> extends UseQueryOptions<A, E, R> {
+  readonly suspendOnWaiting?: boolean | undefined
+}
+
+export interface UseSuspenseQueryResult<A> {
+  readonly data: A
+  readonly isFetching: boolean
+  readonly isStale: boolean
+  readonly refetch: () => void
+}
+
 export interface UseMutationOptions<Arg, A, E, R> {
   readonly mutationKey?: QueryKey | undefined
   readonly mutationFn: (arg: Arg) => Effect.Effect<A, E, R>
@@ -66,6 +77,7 @@ export interface EffectQuery<R> {
     readonly defaultGcTime?: Duration.DurationInput | undefined
   }>
   readonly useQuery: <A, E>(options: UseQueryOptions<A, E, R>) => UseQueryResult<A, E>
+  readonly useSuspenseQuery: <A, E>(options: UseSuspenseQueryOptions<A, E, R>) => UseSuspenseQueryResult<A>
   readonly useMutation: <Arg, A, E>(options: UseMutationOptions<Arg, A, E, R>) => UseMutationResult<Arg, A, E>
   readonly useQueryClient: () => QueryClientApi
 }
@@ -333,11 +345,73 @@ export const createEffectQuery = <R,>(options: {
     }
   }
 
+  const useSuspenseQuery = <A, E>(
+    query: UseSuspenseQueryOptions<A, E, R>
+  ): UseSuspenseQueryResult<A> => {
+    const client = useClient()
+    const keySig = React.useMemo(() => exactKey(query.queryKey), [query.queryKey])
+    const atom = React.useMemo(() => client.getQueryAtom(query), [client, keySig])
+    const registry = React.useContext(RegistryContext)
+
+    if (query.enabled === false) {
+      throw new Error("useSuspenseQuery does not support enabled: false")
+    }
+
+    const result = useAtomValue(atom)
+    const success = useAtomSuspense(atom, { suspendOnWaiting: query.suspendOnWaiting ?? false }) as AtomResult.Success<
+      A,
+      E
+    >
+    const data = success.value
+
+    const staleTimeMs = decodeMillis(query.staleTime, 0)
+    const isStale = computeIsStale(result, staleTimeMs)
+
+    const refetch = React.useCallback(() => {
+      registry.refresh(atom)
+    }, [atom, registry])
+
+    React.useEffect(() => {
+      if (result._tag !== "Initial" && isStale) {
+        refetch()
+      }
+    }, [isStale, refetch, result._tag])
+
+    React.useEffect(() => {
+      if (query.refetchOnWindowFocus === false) return
+      const onFocus = () => {
+        if (computeIsStale(result, staleTimeMs)) {
+          refetch()
+        }
+      }
+      window.addEventListener("focus", onFocus)
+      return () => window.removeEventListener("focus", onFocus)
+    }, [query.refetchOnWindowFocus, refetch, result, staleTimeMs])
+
+    React.useEffect(() => {
+      if (query.refetchOnReconnect === false) return
+      const onOnline = () => refetch()
+      window.addEventListener("online", onOnline)
+      return () => window.removeEventListener("online", onOnline)
+    }, [query.refetchOnReconnect, refetch])
+
+    React.useEffect(() => {
+      const interval = query.refetchInterval
+      if (interval === undefined || interval === false) return
+      const ms = decodeMillis(interval, 0)
+      if (ms <= 0) return
+      const id = window.setInterval(refetch, ms)
+      return () => window.clearInterval(id)
+    }, [query.refetchInterval, refetch])
+
+    return { data, isFetching: result.waiting, isStale, refetch }
+  }
+
   const useQueryClient = (): QueryClientApi => {
-      const client = useClient()
-      const invalidate = useAtomSet(client.invalidate)
-      const getQueryAtom = client.getQueryAtom
-      const registry = React.useContext(RegistryContext)
+    const client = useClient()
+    const invalidate = useAtomSet(client.invalidate)
+    const getQueryAtom = client.getQueryAtom
+    const registry = React.useContext(RegistryContext)
 
     const invalidateQuery = React.useCallback((key: QueryKey) => invalidate([exactKey(key)]), [invalidate])
     const invalidateQueries = React.useCallback((prefix: QueryKey) => invalidate([prefixKey(prefix)]), [invalidate])
@@ -370,5 +444,5 @@ export const createEffectQuery = <R,>(options: {
     }
   }
 
-  return { Provider, useQuery, useMutation, useQueryClient }
+  return { Provider, useQuery, useSuspenseQuery, useMutation, useQueryClient }
 }

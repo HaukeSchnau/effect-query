@@ -2,6 +2,7 @@ import { Result } from "@effect-atom/atom-react"
 import { Effect, Ref } from "effect"
 import * as Cause from "effect/Cause"
 import * as Option from "effect/Option"
+import * as React from "react"
 import { createEffectQuery } from "./effect-query"
 import "./App.css"
 
@@ -45,6 +46,8 @@ export default function App() {
         <CounterCard />
         <div style={{ height: 16 }} />
         <SharedObservers />
+        <div style={{ height: 16 }} />
+        <SuspenseExample />
       </div>
     </EffectQuery.Provider>
   )
@@ -156,4 +159,50 @@ function CounterReadOnly(props: { readonly label: string }) {
       </div>
     </div>
   )
+}
+
+function SuspenseExample() {
+  return (
+    <div className="card" style={{ textAlign: "left" }}>
+      <h2 style={{ marginTop: 0 }}>Suspense Query</h2>
+      <p style={{ marginTop: 0, opacity: 0.8 }}>
+        This uses <code>useSuspenseQuery</code> and suspends only on the initial load.
+      </p>
+      <ErrorBoundary fallback={<div style={{ color: "crimson" }}>Something went wrong.</div>}>
+        <React.Suspense fallback={<div>Loading…</div>}>
+          <SuspenseCounter />
+        </React.Suspense>
+      </ErrorBoundary>
+    </div>
+  )
+}
+
+function SuspenseCounter() {
+  const query = EffectQuery.useSuspenseQuery({
+    queryKey: ["counter", "value"],
+    queryFn: () =>
+      Effect.gen(function*() {
+        const api = yield* CounterApi
+        return yield* api.get
+      }),
+    staleTime: "1 second"
+  })
+
+  return <div style={{ fontSize: 24, fontWeight: 700 }}>{query.data}</div>
+}
+
+class ErrorBoundary extends React.Component<
+  { readonly fallback: React.ReactNode; readonly children?: React.ReactNode },
+  { readonly hasError: boolean }
+> {
+  state = { hasError: false }
+
+  static getDerivedStateFromError() {
+    return { hasError: true }
+  }
+
+  override render() {
+    if (this.state.hasError) return this.props.fallback
+    return this.props.children
+  }
 }
