@@ -9,6 +9,7 @@ import type { Reactivity } from "@effect/experimental/Reactivity"
 import * as Cause from "effect/Cause"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import type * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -82,6 +83,30 @@ export interface UseSuspenseQueryResult<A> {
   readonly refetch: () => void
 }
 
+export type UseSuspenseQueryResultCause<A, E> =
+  | {
+    readonly _tag: "Success"
+    readonly data: A
+    readonly isFetching: boolean
+    readonly isStale: boolean
+    readonly refetch: () => void
+  }
+  | {
+    readonly _tag: "Failure"
+    readonly cause: Cause.Cause<E>
+    readonly previousData: Option.Option<A>
+    readonly isFetching: boolean
+    readonly isStale: boolean
+    readonly refetch: () => void
+  }
+
+export interface UseQueryExitResult<A, E> {
+  readonly exit: Option.Option<Exit.Exit<A, E>>
+  readonly isFetching: boolean
+  readonly isStale: boolean
+  readonly refetch: () => void
+}
+
 export interface UseMutationOptions<Arg, A, E, R> {
   readonly mutationKey?: QueryKey | undefined
   readonly mutationFn: (arg: Arg) => Effect.Effect<A, E, R | QueryClient | Reactivity>
@@ -116,7 +141,18 @@ export interface EffectQuery<R> {
     Arg
   >
   readonly useQuery: <A, E>(options: UseQueryOptions<A, E, R>) => UseQueryResult<A, E>
+  /**
+   * Suspense + throw-on-failure (ErrorBoundary-friendly).
+   */
   readonly useSuspenseQuery: <A, E>(options: UseSuspenseQueryOptions<A, E, R>) => UseSuspenseQueryResult<A>
+  /**
+   * Suspense but does not throw on failure; returns a Cause instead.
+   */
+  readonly useSuspenseQueryCause: <A, E>(options: UseSuspenseQueryOptions<A, E, R>) => UseSuspenseQueryResultCause<A, E>
+  /**
+   * Exit/Cause-first hook for users who want `Exit` semantics.
+   */
+  readonly useQueryExit: <A, E>(options: UseQueryOptions<A, E, R>) => UseQueryExitResult<A, E>
   readonly useMutation: <Arg, A, E>(options: UseMutationOptions<Arg, A, E, R>) => UseMutationResult<Arg, A, E>
   readonly useQueryClient: () => QueryClientApi
 }
@@ -163,6 +199,12 @@ const computeIsStale = <A, E>(result: AtomResult.Result<A, E>, staleTimeMs: numb
     return Date.now() - result.previousSuccess.value.timestamp > staleTimeMs
   }
   return true
+}
+
+const toExitOption = <A, E>(result: AtomResult.Result<A, E>): Option.Option<Exit.Exit<A, E>> => {
+  if (result._tag === "Success") return Option.some(Exit.succeed(result.value))
+  if (result._tag === "Failure") return Option.some(Exit.failCause(result.cause))
+  return Option.none()
 }
 
 const startRefetchFiber = (
@@ -551,6 +593,81 @@ export const createEffectQuery = <R,>(options: {
     return { data, isFetching: result.waiting, isStale, refetch }
   }
 
+  const useSuspenseQueryCause = <A, E>(
+    query: UseSuspenseQueryOptions<A, E, R>
+  ): UseSuspenseQueryResultCause<A, E> => {
+    const client = useClient()
+    const keySig = React.useMemo(() => exactKey(query.queryKey), [query.queryKey])
+    const atom = React.useMemo(() => client.getQueryAtom(query), [client, keySig])
+    const registry = React.useContext(RegistryContext)
+
+    if (query.enabled === false) {
+      throw new Error("useSuspenseQueryCause does not support enabled: false")
+    }
+
+    const result = useAtomValue(atom)
+    const suspenseResult = useAtomSuspense(atom, {
+      suspendOnWaiting: query.suspendOnWaiting ?? false,
+      includeFailure: true
+    }) as AtomResult.Success<A, E> | AtomResult.Failure<A, E>
+
+    const staleTimeMs = decodeMillis(query.staleTime, 0)
+    const isStale = computeIsStale(result, staleTimeMs)
+
+    const refetch = React.useCallback(() => {
+      registry.refresh(atom)
+    }, [atom, registry])
+
+    React.useEffect(() => {
+      if (query.refetch === undefined) return
+      const fiber = startRefetchFiber(query.refetch, refetch)
+      return () => {
+        Effect.runFork(Fiber.interruptFork(fiber))
+      }
+    }, [query.refetch, refetch])
+
+    React.useEffect(() => {
+      if (result._tag !== "Initial" && isStale) {
+        refetch()
+      }
+    }, [isStale, refetch, result._tag])
+
+    React.useEffect(() => {
+      if (query.refetchOnWindowFocus === false) return
+      const onFocus = () => {
+        if (computeIsStale(result, staleTimeMs)) {
+          refetch()
+        }
+      }
+      window.addEventListener("focus", onFocus)
+      return () => window.removeEventListener("focus", onFocus)
+    }, [query.refetchOnWindowFocus, refetch, result, staleTimeMs])
+
+    React.useEffect(() => {
+      if (query.refetchOnReconnect === false) return
+      const onOnline = () => refetch()
+      window.addEventListener("online", onOnline)
+      return () => window.removeEventListener("online", onOnline)
+    }, [query.refetchOnReconnect, refetch])
+
+    if (suspenseResult._tag === "Success") {
+      return { _tag: "Success", data: suspenseResult.value, isFetching: result.waiting, isStale, refetch }
+    }
+    return {
+      _tag: "Failure",
+      cause: suspenseResult.cause,
+      previousData: suspenseResult.previousSuccess.pipe(Option.map((s) => s.value)),
+      isFetching: result.waiting,
+      isStale,
+      refetch
+    }
+  }
+
+  const useQueryExit = <A, E>(query: UseQueryOptions<A, E, R>): UseQueryExitResult<A, E> => {
+    const { result, isFetching, isStale, refetch } = useQuery(query)
+    return { exit: toExitOption(result), isFetching, isStale, refetch }
+  }
+
   const useQueryClient = (): QueryClientApi => {
     const client = useClient()
     const invalidate = useAtomSet(client.invalidate)
@@ -591,5 +708,15 @@ export const createEffectQuery = <R,>(options: {
   const queryAtom = <A, E>(options: UseQueryOptions<A, E, R>) => clientValue.getQueryAtom(options)
   const mutationAtom = <Arg, A, E>(options: UseMutationOptions<Arg, A, E, R>) => clientValue.getMutationAtom(options)
 
-  return { Provider, queryAtom, mutationAtom, useQuery, useSuspenseQuery, useMutation, useQueryClient }
+  return {
+    Provider,
+    queryAtom,
+    mutationAtom,
+    useQuery,
+    useSuspenseQuery,
+    useSuspenseQueryCause,
+    useQueryExit,
+    useMutation,
+    useQueryClient
+  }
 }

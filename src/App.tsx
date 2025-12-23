@@ -2,6 +2,7 @@ import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import * as Atom from "@effect-atom/atom/Atom"
 import { Effect, Ref } from "effect"
 import * as Cause from "effect/Cause"
+import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
 import * as React from "react"
 import * as Schedule from "effect/Schedule"
@@ -58,6 +59,10 @@ export default function App() {
         <RetryExample />
         <div style={{ height: 16 }} />
         <AtomFirstExample />
+        <div style={{ height: 16 }} />
+        <NonThrowingSuspenseExample />
+        <div style={{ height: 16 }} />
+        <ExitExample />
       </div>
     </EffectQuery.Provider>
   )
@@ -376,6 +381,76 @@ function AtomFirstExample() {
       </div>
       <div style={{ marginTop: 8, opacity: 0.75, fontSize: 12 }}>
         This query also polls via <code>refetch: Schedule.spaced("3 seconds")</code>.
+      </div>
+    </div>
+  )
+}
+
+function NonThrowingSuspenseExample() {
+  return (
+    <div className="card" style={{ textAlign: "left" }}>
+      <h2 style={{ marginTop: 0 }}>Suspense (Non-Throwing)</h2>
+      <p style={{ marginTop: 0, opacity: 0.8 }}>
+        Uses <code>useSuspenseQueryCause</code> to suspend on initial load but <em>return</em> a typed{" "}
+        <code>Cause</code> instead of throwing for an ErrorBoundary.
+      </p>
+      <React.Suspense fallback={<div>Loading…</div>}>
+        <NonThrowingSuspenseBody />
+      </React.Suspense>
+    </div>
+  )
+}
+
+function NonThrowingSuspenseBody() {
+  const query = EffectQuery.useSuspenseQueryCause({
+    queryKey: ["demo", "suspense-cause"],
+    effect: Effect.gen(function*() {
+      yield* Effect.sleep("300 millis")
+      return yield* Effect.fail(new Error("Expected demo error"))
+    }),
+    staleTime: Infinity
+  })
+
+  if (query._tag === "Failure") {
+    return (
+      <div>
+        <div style={{ color: "crimson", fontWeight: 700 }}>Error</div>
+        <pre style={{ marginTop: 8 }}>{Cause.pretty(query.cause)}</pre>
+        <button onClick={query.refetch}>Retry</button>
+      </div>
+    )
+  }
+
+  return <div style={{ fontSize: 24, fontWeight: 700 }}>{query.data}</div>
+}
+
+function ExitExample() {
+  const query = EffectQuery.useQueryExit({
+    queryKey: ["demo", "exit"],
+    effect: Effect.suspend(() => (Math.random() < 0.5 ? Effect.fail(new Error("random fail")) : Effect.succeed("ok"))),
+    staleTime: 0
+  })
+
+  const exit = Option.getOrElse(query.exit, () => Exit.die("missing"))
+
+  return (
+    <div className="card" style={{ textAlign: "left" }}>
+      <h2 style={{ marginTop: 0 }}>Exit Semantics</h2>
+      <p style={{ marginTop: 0, opacity: 0.8 }}>
+        Uses <code>useQueryExit</code> to work with <code>Exit</code> / <code>Cause</code> directly.
+      </p>
+      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        <div style={{ flex: 1 }}>
+          {Exit.isSuccess(exit) ? (
+            <div style={{ fontWeight: 700 }}>Success: {exit.value}</div>
+          ) : (
+            <div style={{ color: "crimson", fontWeight: 700 }}>Failure: {Cause.pretty(exit.cause)}</div>
+          )}
+          <div style={{ marginTop: 6, opacity: 0.75, fontSize: 12 }}>
+            isFetching: {String(query.isFetching)}; isStale: {String(query.isStale)}
+          </div>
+        </div>
+        <button onClick={query.refetch}>Refetch</button>
       </div>
     </div>
   )
