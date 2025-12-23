@@ -10,13 +10,17 @@ import type * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
 
+import { QueryContext } from "./QueryContext"
 import { allInvalidationKey, exactKey, prefixKey, queryInvalidationKeys, type QueryKey } from "./queryKeys"
 
 export type QueryStatus = "idle" | "loading" | "success" | "error"
 
-export interface UseQueryOptions<A, E, R> {
+type UseQueryBaseOptions<A> = {
   readonly queryKey: QueryKey
-  readonly queryFn: (options: { readonly queryKey: QueryKey }) => Effect.Effect<A, E, R>
+  /**
+   * Preferred API: a plain Effect that can require services from `createEffectQuery({ layer })`.
+   * If you need the key inside the Effect, use `yield* QueryContext` to access it.
+   */
   readonly enabled?: boolean | undefined
   readonly initialData?: A | (() => A) | undefined
   readonly staleTime?: Duration.DurationInput | undefined
@@ -28,6 +32,21 @@ export interface UseQueryOptions<A, E, R> {
   readonly refetchInterval?: Duration.DurationInput | false | undefined
 }
 
+type UseQueryEffectOptions<A, E, R> = {
+  readonly effect: Effect.Effect<A, E, R | QueryContext>
+  readonly queryFn?: never
+}
+
+type UseQueryFnOptions<A, E, R> = {
+  readonly effect?: never
+  /**
+   * Compatibility API: a function that receives the queryKey.
+   */
+  readonly queryFn: (options: { readonly queryKey: QueryKey }) => Effect.Effect<A, E, R>
+}
+
+export type UseQueryOptions<A, E, R> = UseQueryBaseOptions<A> & (UseQueryEffectOptions<A, E, R> | UseQueryFnOptions<A, E, R>)
+
 export interface UseQueryResult<A, E> {
   readonly result: AtomResult.Result<A, E>
   readonly data: Option.Option<A>
@@ -38,7 +57,7 @@ export interface UseQueryResult<A, E> {
   readonly refetch: () => void
 }
 
-export interface UseSuspenseQueryOptions<A, E, R> extends UseQueryOptions<A, E, R> {
+export type UseSuspenseQueryOptions<A, E, R> = UseQueryOptions<A, E, R> & {
   readonly suspendOnWaiting?: boolean | undefined
 }
 
@@ -129,6 +148,18 @@ export const createEffectQuery = <R,>(options: {
 }): EffectQuery<R> => {
   const runtime = Atom.runtime(options.layer)
 
+  const toEffect = <A, E>(query: UseQueryOptions<A, E, R>): Effect.Effect<A, E, R> => {
+    if (query.effect !== undefined) {
+      return Effect.provideService(query.effect as Effect.Effect<A, E, R | QueryContext>, QueryContext, {
+        queryKey: query.queryKey
+      })
+    }
+    if (query.queryFn !== undefined) {
+      return query.queryFn({ queryKey: query.queryKey })
+    }
+    throw new Error("useQuery requires either `effect` or `queryFn`")
+  }
+
   const createClientValue = (): QueryClientContextValue<R> => {
     const queryAtoms = new Map<string, Atom.Atom<AtomResult.Result<any, any>>>()
 
@@ -147,7 +178,7 @@ export const createEffectQuery = <R,>(options: {
       const retryBaseDelay = query.retryBaseDelay ?? "250 millis"
 
       const atom = runtime.atom(
-        Effect.suspend(() => query.queryFn({ queryKey: query.queryKey })).pipe(
+        Effect.suspend(() => toEffect(query)).pipe(
           retry > 0
             ? Effect.retry(makeRetrySchedule(retry, retryBaseDelay))
             : (effect) => effect

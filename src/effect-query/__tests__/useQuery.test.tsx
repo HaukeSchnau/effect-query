@@ -14,18 +14,17 @@ describe("EffectQuery.useQuery", () => {
     let calls = 0
     const EffectQuery = createEffectQuery({ layer: Layer.empty })
 
-    const queryFn = () =>
-      Effect.promise<number>(() =>
-        new Promise((resolve) => {
-          calls++
-          setTimeout(() => resolve(123), 50)
-        })
-      )
+    const effect = Effect.promise<number>(() =>
+      new Promise((resolve) => {
+        calls++
+        setTimeout(() => resolve(123), 50)
+      })
+    )
 
     function Observer(props: { readonly label: string }) {
       const query = EffectQuery.useQuery({
         queryKey: ["dedupe", 1],
-        queryFn,
+        effect,
         staleTime: "1 hour"
       })
       return (
@@ -57,17 +56,16 @@ describe("EffectQuery.useQuery", () => {
     let n = 0
     const EffectQuery = createEffectQuery({ layer: Layer.empty })
 
-    const queryFn = () =>
-      Effect.promise<number>(() =>
-        new Promise((resolve) => {
-          setTimeout(() => resolve(++n), 50)
-        })
-      )
+    const effect = Effect.promise<number>(() =>
+      new Promise((resolve) => {
+        setTimeout(() => resolve(++n), 50)
+      })
+    )
 
     function Demo() {
       const query = EffectQuery.useQuery({
         queryKey: ["todos", 1],
-        queryFn,
+        effect,
         staleTime: "1 hour"
       })
       const client = EffectQuery.useQueryClient()

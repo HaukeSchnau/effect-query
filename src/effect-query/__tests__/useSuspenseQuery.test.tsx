@@ -11,17 +11,16 @@ describe("EffectQuery.useSuspenseQuery", () => {
     vi.useFakeTimers()
 
     const EffectQuery = createEffectQuery({ layer: Layer.empty })
-    const queryFn = () =>
-      Effect.promise<number>(() =>
-        new Promise((resolve) => {
-          setTimeout(() => resolve(123), 50)
-        })
-      )
+    const effect = Effect.promise<number>(() =>
+      new Promise((resolve) => {
+        setTimeout(() => resolve(123), 50)
+      })
+    )
 
     function Demo() {
       const query = EffectQuery.useSuspenseQuery({
         queryKey: ["suspense", 1],
-        queryFn,
+        effect,
         staleTime: "1 hour"
       })
       return <div data-testid="value">{query.data}</div>
@@ -42,4 +41,3 @@ describe("EffectQuery.useSuspenseQuery", () => {
     vi.useRealTimers()
   })
 })
-

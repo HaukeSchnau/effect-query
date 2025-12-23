@@ -3,7 +3,7 @@ import { Effect, Ref } from "effect"
 import * as Cause from "effect/Cause"
 import * as Option from "effect/Option"
 import * as React from "react"
-import { createEffectQuery } from "./effect-query"
+import { createEffectQuery, QueryContext } from "./effect-query"
 import "./App.css"
 
 class CounterApi extends Effect.Service<CounterApi>()("demo/CounterApi", {
@@ -58,11 +58,12 @@ function CounterCard() {
 
   const query = EffectQuery.useQuery({
     queryKey: ["counter", "value"],
-    queryFn: () =>
-      Effect.gen(function*() {
-        const api = yield* CounterApi
-        return yield* api.get
-      }),
+    effect: Effect.gen(function*() {
+      const _ctx = yield* QueryContext
+      void _ctx
+      const api = yield* CounterApi
+      return yield* api.get
+    }),
     staleTime: "1 second",
     gcTime: "30 seconds",
     refetchOnWindowFocus: true
@@ -142,11 +143,10 @@ function SharedObservers() {
 function CounterReadOnly(props: { readonly label: string }) {
   const query = EffectQuery.useQuery({
     queryKey: ["counter", "value"],
-    queryFn: () =>
-      Effect.gen(function*() {
-        const api = yield* CounterApi
-        return yield* api.get
-      }),
+    effect: Effect.gen(function*() {
+      const api = yield* CounterApi
+      return yield* api.get
+    }),
     staleTime: "1 second"
   })
 
@@ -180,11 +180,10 @@ function SuspenseExample() {
 function SuspenseCounter() {
   const query = EffectQuery.useSuspenseQuery({
     queryKey: ["counter", "value"],
-    queryFn: () =>
-      Effect.gen(function*() {
-        const api = yield* CounterApi
-        return yield* api.get
-      }),
+    effect: Effect.gen(function*() {
+      const api = yield* CounterApi
+      return yield* api.get
+    }),
     staleTime: "1 second"
   })
 
