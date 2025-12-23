@@ -3,6 +3,7 @@ import { Effect, Ref } from "effect"
 import * as Cause from "effect/Cause"
 import * as Option from "effect/Option"
 import * as React from "react"
+import * as Schedule from "effect/Schedule"
 import { createEffectQuery, QueryClient, QueryContext } from "./effect-query"
 import "./App.css"
 
@@ -26,7 +27,9 @@ class CounterApi extends Effect.Service<CounterApi>()("demo/CounterApi", {
       return next
     })
 
-    return { get, increment } as const
+    const calls = Ref.get(getCalls)
+
+    return { get, increment, calls } as const
   })
 }) {}
 
@@ -48,6 +51,10 @@ export default function App() {
         <SharedObservers />
         <div style={{ height: 16 }} />
         <SuspenseExample />
+        <div style={{ height: 16 }} />
+        <PollingExample />
+        <div style={{ height: 16 }} />
+        <RetryExample />
       </div>
     </EffectQuery.Provider>
   )
@@ -206,4 +213,108 @@ class ErrorBoundary extends React.Component<
     if (this.state.hasError) return this.props.fallback
     return this.props.children
   }
+}
+
+function PollingExample() {
+  const [enabled, setEnabled] = React.useState(true)
+
+  const polledValue = EffectQuery.useQuery({
+    queryKey: ["counter", "polled"],
+    effect: Effect.gen(function*() {
+      const api = yield* CounterApi
+      return yield* api.get
+    }),
+    staleTime: Infinity,
+    enabled,
+    refetch: Schedule.spaced("2 seconds")
+  })
+
+  const callCount = EffectQuery.useQuery({
+    queryKey: ["counter", "calls"],
+    effect: Effect.gen(function*() {
+      const api = yield* CounterApi
+      return yield* api.calls
+    }),
+    staleTime: "250 millis",
+    enabled
+  })
+
+  return (
+    <div className="card" style={{ textAlign: "left" }}>
+      <h2 style={{ marginTop: 0 }}>Schedule-Based Polling</h2>
+      <p style={{ marginTop: 0, opacity: 0.8 }}>
+        Polls with <code>refetch: Schedule.spaced("2 seconds")</code> (no setInterval).
+      </p>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        <div style={{ flex: 1 }}>
+          {Result.builder(polledValue.result)
+            .onInitial(() => <div>Loading…</div>)
+            .onFailure((cause: Cause.Cause<Error>) => <div>Error: {Cause.pretty(cause)}</div>)
+            .onSuccess((value: number, { waiting }: { readonly waiting: boolean }) => (
+              <div>
+                <div style={{ fontSize: 24, fontWeight: 700 }}>{value}</div>
+                <div style={{ opacity: 0.7 }}>{waiting ? "Polling…" : "Idle"}</div>
+              </div>
+            ))
+            .render()}
+          <div style={{ marginTop: 8, opacity: 0.75, fontSize: 12 }}>
+            get() calls: {Option.getOrElse(callCount.data, () => 0)}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <button onClick={() => setEnabled((v) => !v)}>{enabled ? "Stop" : "Start"}</button>
+          <button onClick={polledValue.refetch}>Manual refetch</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function RetryExample() {
+  const attempts = React.useRef(0)
+
+  const retry = Schedule.exponential("200 millis").pipe(Schedule.intersect(Schedule.recurs(5)))
+
+  const query = EffectQuery.useQuery({
+    queryKey: ["retry", "demo"],
+    effect: Effect.suspend(() => {
+      attempts.current++
+      if (attempts.current < 3) return Effect.fail(new Error(`Transient error (attempt ${attempts.current})`))
+      return Effect.succeed(`Succeeded on attempt ${attempts.current}`)
+    }),
+    staleTime: Infinity,
+    retry
+  })
+
+  return (
+    <div className="card" style={{ textAlign: "left" }}>
+      <h2 style={{ marginTop: 0 }}>Schedule-Based Retry</h2>
+      <p style={{ marginTop: 0, opacity: 0.8 }}>
+        Retries with <code>retry: Schedule.exponential("200 millis")</code> capped by <code>Schedule.recurs(5)</code>.
+      </p>
+      {Result.builder(query.result)
+        .onInitial(() => <div>Loading…</div>)
+        .onFailure((cause: Cause.Cause<Error>) => <div style={{ color: "crimson" }}>Error: {Cause.pretty(cause)}</div>)
+        .onSuccess((value: string, { waiting }: { readonly waiting: boolean }) => (
+          <div>
+            <div style={{ fontWeight: 700 }}>{value}</div>
+            <div style={{ opacity: 0.7 }}>{waiting ? "Retrying…" : "Done"}</div>
+          </div>
+        ))
+        .render()}
+      <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+        <button onClick={query.refetch}>Run again</button>
+        <button
+          onClick={() => {
+            attempts.current = 0
+            query.refetch()
+          }}
+        >
+          Reset attempts + run
+        </button>
+      </div>
+    </div>
+  )
 }

@@ -9,6 +9,7 @@ import type { Reactivity } from "@effect/experimental/Reactivity"
 import * as Cause from "effect/Cause"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import type * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
@@ -19,7 +20,7 @@ import { allInvalidationKey, exactKey, prefixKey, queryInvalidationKeys, type Qu
 
 export type QueryStatus = "idle" | "loading" | "success" | "error"
 
-type UseQueryBaseOptions<A> = {
+type UseQueryBaseOptions<A, E> = {
   readonly queryKey: QueryKey
   /**
    * Preferred API: a plain Effect that can require services from `createEffectQuery({ layer })`.
@@ -29,11 +30,20 @@ type UseQueryBaseOptions<A> = {
   readonly initialData?: A | (() => A) | undefined
   readonly staleTime?: Duration.DurationInput | undefined
   readonly gcTime?: Duration.DurationInput | undefined
-  readonly retry?: boolean | number | undefined
-  readonly retryBaseDelay?: Duration.DurationInput | undefined
+  /**
+   * Retry policy for the query.
+   *
+   * Example: `Schedule.exponential("200 millis").pipe(Schedule.jittered, Schedule.intersect(Schedule.recurs(3)))`
+   */
+  readonly retry?: Schedule.Schedule<any, E, any> | undefined
   readonly refetchOnWindowFocus?: boolean | undefined
   readonly refetchOnReconnect?: boolean | undefined
-  readonly refetchInterval?: Duration.DurationInput | false | undefined
+  /**
+   * Polling policy for refetching this query (after it has been mounted).
+   *
+   * Example: `Schedule.spaced("30 seconds")`
+   */
+  readonly refetch?: Schedule.Schedule<any, unknown, any> | undefined
 }
 
 type UseQueryEffectOptions<A, E, R> = {
@@ -49,7 +59,7 @@ type UseQueryFnOptions<A, E, R> = {
   readonly queryFn: (options: { readonly queryKey: QueryKey }) => Effect.Effect<A, E, R>
 }
 
-export type UseQueryOptions<A, E, R> = UseQueryBaseOptions<A> & (UseQueryEffectOptions<A, E, R> | UseQueryFnOptions<A, E, R>)
+export type UseQueryOptions<A, E, R> = UseQueryBaseOptions<A, E> & (UseQueryEffectOptions<A, E, R> | UseQueryFnOptions<A, E, R>)
 
 export interface UseQueryResult<A, E> {
   readonly result: AtomResult.Result<A, E>
@@ -119,9 +129,6 @@ const decodeMillis = (input: Duration.DurationInput | undefined, fallbackMs: num
   return Duration.toMillis(Duration.decode(input))
 }
 
-const makeRetrySchedule = (retries: number, baseDelay: Duration.DurationInput): Schedule.Schedule<unknown, unknown> =>
-  Schedule.exponential(baseDelay).pipe(Schedule.jittered, Schedule.intersect(Schedule.recurs(retries)))
-
   const computeData = <A, E>(result: AtomResult.Result<A, E>): Option.Option<A> => {
     if (result._tag === "Success") return Option.some(result.value)
     if (result._tag === "Failure") return result.previousSuccess.pipe(Option.map((s) => s.value))
@@ -146,6 +153,26 @@ const computeIsStale = <A, E>(result: AtomResult.Result<A, E>, staleTimeMs: numb
     return Date.now() - result.previousSuccess.value.timestamp > staleTimeMs
   }
   return true
+}
+
+const startRefetchFiber = (
+  schedule: Schedule.Schedule<any, unknown, any>,
+  refresh: () => void
+): Fiber.Fiber<void, never> => {
+  const scheduleVoid = schedule.pipe(Schedule.mapInput(() => undefined as unknown))
+  const program = Effect.gen(function*() {
+    const driver = yield* Schedule.driver(scheduleVoid)
+    while (true) {
+      const exit = yield* Effect.exit(driver.next(undefined))
+      if (exit._tag === "Failure") {
+        return
+      }
+      refresh()
+    }
+  })
+  // The schedule may require services like `Clock` / `Random` which are available in the default runtime,
+  // but `runFork` is typed as requiring `never`, so we erase the requirement here.
+  return Effect.runFork(program as Effect.Effect<void, never, never>)
 }
 
 export const createEffectQuery = <R,>(options: {
@@ -186,21 +213,16 @@ export const createEffectQuery = <R,>(options: {
       const cached = queryAtoms.get(keyHash) as Atom.Atom<AtomResult.Result<A, E>> | undefined
       if (cached !== undefined) return cached
 
-      const retry = query.retry === true ? 3 : query.retry === false || query.retry === undefined ? 0 : query.retry
-      const retryBaseDelay = query.retryBaseDelay ?? "250 millis"
+      const base: Effect.Effect<A, E, any> = Effect.suspend(() => toEffect(query)) as any
+      const retried: Effect.Effect<A, E, any> = query.retry !== undefined
+        ? (Effect.retry(base, query.retry as any) as any)
+        : base
 
-      const atom = runtime.atom(
-        Effect.suspend(() => toEffect(query)).pipe(
-          retry > 0
-            ? Effect.retry(makeRetrySchedule(retry, retryBaseDelay))
-            : (effect) => effect
-        ),
-        {
-          initialValue: query.initialData !== undefined
-            ? (typeof query.initialData === "function" ? (query.initialData as () => A)() : query.initialData)
-            : undefined
-        }
-      ).pipe(
+      const atom = runtime.atom(retried, {
+        initialValue: query.initialData !== undefined
+          ? (typeof query.initialData === "function" ? (query.initialData as () => A)() : query.initialData)
+          : undefined
+      }).pipe(
         Atom.withReactivity(queryInvalidationKeys(query.queryKey)),
         query.gcTime === undefined
           ? Atom.setIdleTTL("5 minutes")
@@ -304,32 +326,41 @@ export const createEffectQuery = <R,>(options: {
     )
     const result = useAtomValue(readAtom)
 
-      const staleTimeMs = decodeMillis(query.staleTime, 0)
-      const isStale = enabled ? computeIsStale(result, staleTimeMs) : false
+    const staleTimeMs = decodeMillis(query.staleTime, 0)
+    const isStale = enabled ? computeIsStale(result, staleTimeMs) : false
 
-      const latestResultRef = React.useRef(result)
-      latestResultRef.current = result
+    const latestResultRef = React.useRef(result)
+    latestResultRef.current = result
 
-      const refetch = React.useCallback(() => {
-        if (enabled) {
-          registry.refresh(atom)
-          return
-        }
-        const dispose = registry.mount(atom)
+    const refetch = React.useCallback(() => {
+      if (enabled) {
         registry.refresh(atom)
-        const unsub = registry.subscribe(atom, (next: any) => {
-          if (next._tag === "Initial" || next.waiting) return
-          unsub()
-          dispose()
-        })
-      }, [atom, enabled, registry])
+        return
+      }
+      const dispose = registry.mount(atom)
+      registry.refresh(atom)
+      const unsub = registry.subscribe(atom, (next: any) => {
+        if (next._tag === "Initial" || next.waiting) return
+        unsub()
+        dispose()
+      })
+    }, [atom, enabled, registry])
 
-      React.useEffect(() => {
-        if (!enabled) return
-        if (result._tag !== "Initial" && isStale) {
-          refetch()
-        }
-      }, [enabled, isStale, refetch, result._tag])
+    React.useEffect(() => {
+      if (!enabled) return
+      if (query.refetch === undefined) return
+      const fiber = startRefetchFiber(query.refetch, refetch)
+      return () => {
+        Effect.runFork(Fiber.interruptFork(fiber))
+      }
+    }, [enabled, query.refetch, refetch])
+
+    React.useEffect(() => {
+      if (!enabled) return
+      if (result._tag !== "Initial" && isStale) {
+        refetch()
+      }
+    }, [enabled, isStale, refetch, result._tag])
 
     React.useEffect(() => {
       if (!enabled) return
@@ -350,16 +381,6 @@ export const createEffectQuery = <R,>(options: {
       window.addEventListener("online", onOnline)
       return () => window.removeEventListener("online", onOnline)
     }, [enabled, query.refetchOnReconnect, refetch])
-
-    React.useEffect(() => {
-      if (!enabled) return
-      const interval = query.refetchInterval
-      if (interval === undefined || interval === false) return
-      const ms = decodeMillis(interval, 0)
-      if (ms <= 0) return
-      const id = window.setInterval(refetch, ms)
-      return () => window.clearInterval(id)
-    }, [enabled, query.refetchInterval, refetch])
 
     return {
       result,
@@ -473,6 +494,14 @@ export const createEffectQuery = <R,>(options: {
     }, [atom, registry])
 
     React.useEffect(() => {
+      if (query.refetch === undefined) return
+      const fiber = startRefetchFiber(query.refetch, refetch)
+      return () => {
+        Effect.runFork(Fiber.interruptFork(fiber))
+      }
+    }, [query.refetch, refetch])
+
+    React.useEffect(() => {
       if (result._tag !== "Initial" && isStale) {
         refetch()
       }
@@ -495,15 +524,6 @@ export const createEffectQuery = <R,>(options: {
       window.addEventListener("online", onOnline)
       return () => window.removeEventListener("online", onOnline)
     }, [query.refetchOnReconnect, refetch])
-
-    React.useEffect(() => {
-      const interval = query.refetchInterval
-      if (interval === undefined || interval === false) return
-      const ms = decodeMillis(interval, 0)
-      if (ms <= 0) return
-      const id = window.setInterval(refetch, ms)
-      return () => window.clearInterval(id)
-    }, [query.refetchInterval, refetch])
 
     return { data, isFetching: result.waiting, isStale, refetch }
   }
