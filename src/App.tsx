@@ -3,7 +3,7 @@ import { Effect, Ref } from "effect"
 import * as Cause from "effect/Cause"
 import * as Option from "effect/Option"
 import * as React from "react"
-import { createEffectQuery, QueryContext } from "./effect-query"
+import { createEffectQuery, QueryClient, QueryContext } from "./effect-query"
 import "./App.css"
 
 class CounterApi extends Effect.Service<CounterApi>()("demo/CounterApi", {
@@ -73,10 +73,12 @@ function CounterCard() {
     mutationFn: () =>
       Effect.gen(function*() {
         const api = yield* CounterApi
-        return yield* api.increment
-      }),
-      invalidate: ["counter"]
-    })
+        const next = yield* api.increment
+        const client = yield* QueryClient
+        yield* client.invalidateQueries(["counter"])
+        return next
+      })
+  })
 
   return (
     <div className="card" style={{ textAlign: "left" }}>

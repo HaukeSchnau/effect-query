@@ -1,8 +1,11 @@
 import { RegistryContext, RegistryProvider, useAtomSuspense, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
 import * as Atom from "@effect-atom/atom/Atom"
+import { AtomRegistry } from "@effect-atom/atom/Registry"
+import type * as Registry from "@effect-atom/atom/Registry"
 import * as AtomResult from "@effect-atom/atom/Result"
 import * as React from "react"
 import * as Reactivity_ from "@effect/experimental/Reactivity"
+import type { Reactivity } from "@effect/experimental/Reactivity"
 import * as Cause from "effect/Cause"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -11,6 +14,7 @@ import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
 
 import { QueryContext } from "./QueryContext"
+import { QueryClient, type QueryClientService } from "./QueryClient"
 import { allInvalidationKey, exactKey, prefixKey, queryInvalidationKeys, type QueryKey } from "./queryKeys"
 
 export type QueryStatus = "idle" | "loading" | "success" | "error"
@@ -33,7 +37,7 @@ type UseQueryBaseOptions<A> = {
 }
 
 type UseQueryEffectOptions<A, E, R> = {
-  readonly effect: Effect.Effect<A, E, R | QueryContext>
+  readonly effect: Effect.Effect<A, E, R | QueryContext | QueryClient | Reactivity>
   readonly queryFn?: never
 }
 
@@ -70,7 +74,7 @@ export interface UseSuspenseQueryResult<A> {
 
 export interface UseMutationOptions<Arg, A, E, R> {
   readonly mutationKey?: QueryKey | undefined
-  readonly mutationFn: (arg: Arg) => Effect.Effect<A, E, R>
+  readonly mutationFn: (arg: Arg) => Effect.Effect<A, E, R | QueryClient | Reactivity>
   readonly invalidate?: ReadonlyArray<QueryKey> | QueryKey | undefined
 }
 
@@ -105,6 +109,7 @@ type QueryClientContextValue<R> = {
   readonly runtime: Atom.AtomRuntime<R, never>
   readonly getQueryAtom: <A, E>(options: UseQueryOptions<A, E, R>) => Atom.Atom<AtomResult.Result<A, E>>
   readonly invalidate: Atom.Writable<AtomResult.Result<void, never>, ReadonlyArray<string>>
+  readonly queryClient: QueryClientService
 }
 
 const QueryClientContext = React.createContext<QueryClientContextValue<any> | null>(null)
@@ -148,20 +153,27 @@ export const createEffectQuery = <R,>(options: {
 }): EffectQuery<R> => {
   const runtime = Atom.runtime(options.layer)
 
-  const toEffect = <A, E>(query: UseQueryOptions<A, E, R>): Effect.Effect<A, E, R> => {
-    if (query.effect !== undefined) {
-      return Effect.provideService(query.effect as Effect.Effect<A, E, R | QueryContext>, QueryContext, {
-        queryKey: query.queryKey
-      })
-    }
-    if (query.queryFn !== undefined) {
-      return query.queryFn({ queryKey: query.queryKey })
-    }
-    throw new Error("useQuery requires either `effect` or `queryFn`")
-  }
-
   const createClientValue = (): QueryClientContextValue<R> => {
     const queryAtoms = new Map<string, Atom.Atom<AtomResult.Result<any, any>>>()
+
+    let queryClientService!: QueryClientService
+
+    const toEffect = <A, E>(query: UseQueryOptions<A, E, R>): Effect.Effect<A, E, R> => {
+      const effect = (query as any).effect as Effect.Effect<A, E, R | QueryContext | QueryClient> | undefined
+      if (effect !== undefined) {
+        return effect.pipe(
+          Effect.provideService(QueryContext, { queryKey: query.queryKey }),
+          Effect.provideService(QueryClient, queryClientService)
+        ) as Effect.Effect<A, E, R>
+      }
+      if (query.queryFn === undefined) {
+        throw new Error("useQuery requires either `effect` or `queryFn`")
+      }
+      return query.queryFn({ queryKey: query.queryKey }).pipe(
+        Effect.provideService(QueryContext, { queryKey: query.queryKey }),
+        Effect.provideService(QueryClient, queryClientService)
+      ) as Effect.Effect<A, E, R>
+    }
 
     const invalidate = runtime.fn(
       Effect.fnUntraced(function*(keys: ReadonlyArray<string>) {
@@ -199,7 +211,65 @@ export const createEffectQuery = <R,>(options: {
       return atom
     }
 
-    return { runtime, getQueryAtom, invalidate }
+    const awaitAtomComplete = <A, E>(registry: Registry.Registry, atom: Atom.Atom<AtomResult.Result<A, E>>) =>
+      Effect.async<AtomResult.Result<A, E>, never>((resume) => {
+        const unsub = registry.subscribe(atom, (result: AtomResult.Result<A, E>) => {
+          if (result._tag === "Initial" || result.waiting) return
+          unsub()
+          resume(Effect.succeed(result))
+        })
+        return Effect.sync(() => unsub())
+      })
+
+    queryClientService = {
+      invalidateQuery: (key) => Reactivity_.invalidate([exactKey(key)]),
+      invalidateQueries: (prefix) => Reactivity_.invalidate([prefixKey(prefix)]),
+      invalidateAll: Reactivity_.invalidate([allInvalidationKey]),
+      prefetch: (key, effect) =>
+        Effect.gen(function*() {
+          const registry = yield* AtomRegistry
+          const atom = getQueryAtom({ queryKey: key, effect } as any as UseQueryOptions<any, any, R>)
+          return yield* Effect.acquireUseRelease(
+            Effect.sync(() => registry.mount(atom)),
+            () =>
+              Effect.gen(function*() {
+                registry.refresh(atom)
+                const result = yield* awaitAtomComplete(registry, atom)
+                if (result._tag === "Success") {
+                  return
+                }
+                if (result._tag === "Failure") {
+                  return yield* Effect.failCause(result.cause)
+                }
+                return yield* Effect.die("Unexpected query result state")
+              }),
+            (dispose) => Effect.sync(dispose)
+          )
+        }),
+      ensureQueryData: (key, effect) =>
+        Effect.gen(function*() {
+          const registry = yield* AtomRegistry
+          const atom = getQueryAtom({ queryKey: key, effect } as any as UseQueryOptions<any, any, R>)
+          return yield* Effect.acquireUseRelease(
+            Effect.sync(() => registry.mount(atom)),
+            () =>
+              Effect.gen(function*() {
+                registry.refresh(atom)
+                const result = yield* awaitAtomComplete(registry, atom)
+                if (result._tag === "Success") {
+                  return result.value
+                }
+                if (result._tag === "Failure") {
+                  return yield* Effect.failCause(result.cause)
+                }
+                return yield* Effect.die("Unexpected query result state")
+              }),
+            (dispose) => Effect.sync(dispose)
+          )
+        })
+    }
+
+    return { runtime, getQueryAtom, invalidate, queryClient: queryClientService }
   }
 
   const Provider: EffectQuery<R>["Provider"] = (props) => {
@@ -327,11 +397,11 @@ export const createEffectQuery = <R,>(options: {
       () =>
         client.runtime.fn(
           Effect.fnUntraced(function*(arg: any) {
-            return yield* mutation.mutationFn(arg as Arg)
+            return yield* mutation.mutationFn(arg as Arg).pipe(Effect.provideService(QueryClient, client.queryClient))
           }),
           invalidationKeys.length > 0 ? { reactivityKeys: invalidationKeys } : undefined
         ),
-      [client.runtime, invalidationKeys, mutation.mutationFn]
+      [client.queryClient, client.runtime, invalidationKeys, mutation.mutationFn]
     )
 
     const run = useAtomSet(mutationAtom, { mode: "promiseExit" })
