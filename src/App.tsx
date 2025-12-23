@@ -6,7 +6,7 @@ import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
 import * as React from "react"
 import * as Schedule from "effect/Schedule"
-import { createEffectQuery, QueryClient, QueryContext } from "./effect-query"
+import { createEffectQuery, Invalidation, QueryClient, QueryContext } from "./effect-query"
 import "./App.css"
 
 class CounterApi extends Effect.Service<CounterApi>()("demo/CounterApi", {
@@ -81,7 +81,8 @@ function CounterCard() {
     }),
     staleTime: "1 second",
     gcTime: "30 seconds",
-    refetchOnWindowFocus: true
+    refetchOnWindowFocus: true,
+    tags: [{ tag: "counter" }]
   })
 
   const mutation = EffectQuery.useMutation({
@@ -90,7 +91,7 @@ function CounterCard() {
         const api = yield* CounterApi
         const next = yield* api.increment
         const client = yield* QueryClient
-        yield* client.invalidateQueries(["counter"])
+        yield* client.invalidate(Invalidation.tag("counter"))
         return next
       })
   })
@@ -118,7 +119,7 @@ function CounterCard() {
             +1 (mutation)
           </button>
           <button onClick={query.refetch}>Refetch</button>
-          <button onClick={() => client.invalidateQueries(["counter"])}>Invalidate ["counter"]</button>
+          <button onClick={() => client.invalidate(Invalidation.tag("counter"))}>Invalidate tag("counter")</button>
         </div>
       </div>
 
@@ -164,7 +165,8 @@ function CounterReadOnly(props: { readonly label: string }) {
       const api = yield* CounterApi
       return yield* api.get
     }),
-    staleTime: "1 second"
+    staleTime: "1 second",
+    tags: [{ tag: "counter" }]
   })
 
   return (
@@ -201,7 +203,8 @@ function SuspenseCounter() {
       const api = yield* CounterApi
       return yield* api.get
     }),
-    staleTime: "1 second"
+    staleTime: "1 second",
+    tags: [{ tag: "counter" }]
   })
 
   return <div style={{ fontSize: 24, fontWeight: 700 }}>{query.data}</div>
@@ -234,7 +237,8 @@ function PollingExample() {
     }),
     staleTime: Infinity,
     enabled,
-    refetch: Schedule.spaced("2 seconds")
+    refetch: Schedule.spaced("2 seconds"),
+    tags: [{ tag: "counter" }]
   })
 
   const callCount = EffectQuery.useQuery({
@@ -337,7 +341,8 @@ function AtomFirstExample() {
           return yield* api.get
         }),
         staleTime: "1 second",
-        refetch: Schedule.spaced("3 seconds")
+        refetch: Schedule.spaced("3 seconds"),
+        tags: [{ tag: "counter" }]
       }),
     []
   )
@@ -347,7 +352,7 @@ function AtomFirstExample() {
     [counterQueryAtom]
   )
 
-  const bumpAtom = React.useMemo(
+      const bumpAtom = React.useMemo(
     () =>
       EffectQuery.mutationAtom({
         mutationKey: ["counter", "atom-first", "bump"],
@@ -356,7 +361,7 @@ function AtomFirstExample() {
             const api = yield* CounterApi
             return yield* api.increment
           }),
-        invalidate: ["counter"]
+        invalidate: Invalidation.tag("counter")
       }),
     []
   )
@@ -376,7 +381,7 @@ function AtomFirstExample() {
         <div style={{ fontSize: 24, fontWeight: 700, minWidth: 80 }}>{value}</div>
         <div style={{ display: "flex", gap: 8 }}>
           <button onClick={() => void bump(void 0)}>+1 (mutationAtom)</button>
-          <button onClick={() => client.invalidateQueries(["counter"])}>Invalidate ["counter"]</button>
+          <button onClick={() => client.invalidate(Invalidation.tag("counter"))}>Invalidate tag("counter")</button>
         </div>
       </div>
       <div style={{ marginTop: 8, opacity: 0.75, fontSize: 12 }}>
@@ -408,7 +413,8 @@ function NonThrowingSuspenseBody() {
       yield* Effect.sleep("300 millis")
       return yield* Effect.fail(new Error("Expected demo error"))
     }),
-    staleTime: Infinity
+    staleTime: Infinity,
+    tags: [{ tag: "demo-errors" }]
   })
 
   if (query._tag === "Failure") {

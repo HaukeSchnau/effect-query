@@ -1,4 +1,5 @@
 export * from "./createEffectQuery"
 export * from "./QueryClient"
 export * from "./QueryContext"
+export * from "./invalidation"
 export * from "./queryKeys"

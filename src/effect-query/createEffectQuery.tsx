@@ -17,7 +17,14 @@ import * as Schedule from "effect/Schedule"
 
 import { QueryContext } from "./QueryContext"
 import { QueryClient, type QueryClientService } from "./QueryClient"
-import { allInvalidationKey, exactKey, hashQueryKey, prefixKey, queryInvalidationKeys, type QueryKey } from "./queryKeys"
+import { exactKey, hashQueryKey, type QueryKey } from "./queryKeys"
+import {
+  compileInvalidations,
+  Invalidation,
+  type Invalidation as InvalidationSpec,
+  queryInvalidationKeys,
+  type QueryTag
+} from "./invalidation"
 
 export type QueryStatus = "idle" | "loading" | "success" | "error"
 
@@ -31,6 +38,10 @@ type UseQueryBaseOptions<A, E> = {
   readonly initialData?: A | (() => A) | undefined
   readonly staleTime?: Duration.DurationInput | undefined
   readonly gcTime?: Duration.DurationInput | undefined
+  /**
+   * Extra invalidation tags for this query (in addition to its queryKey exact/prefix keys).
+   */
+  readonly tags?: ReadonlyArray<QueryTag> | undefined
   /**
    * Retry policy for the query.
    *
@@ -110,7 +121,10 @@ export interface UseQueryExitResult<A, E> {
 export interface UseMutationOptions<Arg, A, E, R> {
   readonly mutationKey?: QueryKey | undefined
   readonly mutationFn: (arg: Arg) => Effect.Effect<A, E, R | QueryClient | Reactivity>
-  readonly invalidate?: ReadonlyArray<QueryKey> | QueryKey | undefined
+  /**
+   * Typed invalidation algebra; compiled to Reactivity keys internally.
+   */
+  readonly invalidate?: InvalidationSpec | ReadonlyArray<InvalidationSpec> | undefined
   readonly reactivityKeys?: ReadonlyArray<unknown> | Record<string, ReadonlyArray<unknown>> | undefined
 }
 
@@ -124,8 +138,11 @@ export interface UseMutationResult<Arg, A, E> {
 }
 
 export interface QueryClientApi {
+  readonly invalidate: (inv: InvalidationSpec | ReadonlyArray<InvalidationSpec>) => void
   readonly invalidateQuery: (key: QueryKey) => void
   readonly invalidateQueries: (prefix: QueryKey) => void
+  readonly invalidateTag: (tag: string) => void
+  readonly invalidateTagId: (tag: string, id: unknown) => void
   readonly invalidateAll: () => void
   readonly prefetchQuery: <A, E, R>(options: Omit<UseQueryOptions<A, E, R>, "enabled">) => Promise<void>
 }
@@ -276,7 +293,7 @@ export const createEffectQuery = <R,>(options: {
           ? (typeof query.initialData === "function" ? (query.initialData as () => A)() : query.initialData)
           : undefined
       }).pipe(
-        Atom.withReactivity(queryInvalidationKeys(query.queryKey)),
+        Atom.withReactivity(queryInvalidationKeys(query.queryKey, query.tags)),
         query.gcTime === undefined
           ? Atom.setIdleTTL("5 minutes")
           : Atom.setIdleTTL(query.gcTime)
@@ -286,14 +303,6 @@ export const createEffectQuery = <R,>(options: {
       return atom
     }
 
-    const normalizeInvalidates = (value: UseMutationOptions<any, any, any, any>["invalidate"]): ReadonlyArray<QueryKey> => {
-      if (value === undefined) return []
-      if (Array.isArray(value) && value.length > 0 && (value as ReadonlyArray<any>).every(Array.isArray)) {
-        return value as ReadonlyArray<QueryKey>
-      }
-      return [value as QueryKey]
-    }
-
     const getMutationAtom = <Arg, A, E>(mutation: UseMutationOptions<Arg, A, E, R>) => {
       const keyHash = mutation.mutationKey ? `eq:m:${hashQueryKey(mutation.mutationKey)}` : undefined
       if (keyHash !== undefined) {
@@ -301,8 +310,8 @@ export const createEffectQuery = <R,>(options: {
         if (cached !== undefined) return cached
       }
 
-      const invalidationKeys = normalizeInvalidates(mutation.invalidate).map(prefixKey)
-      const reactivityKeys = mutation.reactivityKeys ?? (invalidationKeys.length > 0 ? invalidationKeys : undefined)
+      const reactivityKeys = mutation.reactivityKeys ??
+        (mutation.invalidate !== undefined ? compileInvalidations(mutation.invalidate) : undefined)
 
       const atom = runtime.fn(
         Effect.fnUntraced(function*(arg: Arg) {
@@ -328,9 +337,10 @@ export const createEffectQuery = <R,>(options: {
       })
 
     queryClientService = {
-      invalidateQuery: (key) => Reactivity_.invalidate([exactKey(key)]),
-      invalidateQueries: (prefix) => Reactivity_.invalidate([prefixKey(prefix)]),
-      invalidateAll: Reactivity_.invalidate([allInvalidationKey]),
+      invalidateQuery: (key) => Reactivity_.invalidate(compileInvalidations(Invalidation.exact(key))),
+      invalidateQueries: (prefix) => Reactivity_.invalidate(compileInvalidations(Invalidation.prefix(prefix))),
+      invalidateAll: Reactivity_.invalidate(compileInvalidations(Invalidation.all())),
+      invalidate: (inv) => Reactivity_.invalidate(compileInvalidations(inv)),
       prefetch: (key, effect) =>
         Effect.gen(function*() {
           const registry = yield* AtomRegistry
@@ -674,9 +684,20 @@ export const createEffectQuery = <R,>(options: {
     const getQueryAtom = client.getQueryAtom
     const registry = React.useContext(RegistryContext)
 
-    const invalidateQuery = React.useCallback((key: QueryKey) => invalidate([exactKey(key)]), [invalidate])
-    const invalidateQueries = React.useCallback((prefix: QueryKey) => invalidate([prefixKey(prefix)]), [invalidate])
-    const invalidateAll = React.useCallback(() => invalidate([allInvalidationKey]), [invalidate])
+    const invalidateTyped = React.useCallback(
+      (inv: InvalidationSpec | ReadonlyArray<InvalidationSpec>) => invalidate(compileInvalidations(inv)),
+      [invalidate]
+    )
+    const invalidateQuery = React.useCallback((key: QueryKey) => invalidateTyped(Invalidation.exact(key)), [invalidateTyped])
+    const invalidateQueries = React.useCallback(
+      (prefix: QueryKey) => invalidateTyped(Invalidation.prefix(prefix)),
+      [invalidateTyped]
+    )
+    const invalidateTag = React.useCallback((tag: string) => invalidateTyped(Invalidation.tag(tag)), [invalidateTyped])
+    const invalidateTagId = React.useCallback(
+      (tag: string, id: unknown) => invalidateTyped(Invalidation.tagId(tag, id)),
+      [invalidateTyped]
+    )
 
     // Prefetch needs the current registry, which is only available via the RegistryContext hook.
     // We implement it by reading the registry through a tiny atom, then mounting the query atom.
@@ -698,9 +719,12 @@ export const createEffectQuery = <R,>(options: {
     )
 
     return {
+      invalidate: invalidateTyped,
       invalidateQuery,
       invalidateQueries,
-      invalidateAll,
+      invalidateTag,
+      invalidateTagId,
+      invalidateAll: () => invalidateTyped(Invalidation.all()),
       prefetchQuery: prefetchQueryWithRegistry
     }
   }

@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest"
 import { Effect } from "effect"
-import { allInvalidationKey, exactKey, prefixKey, queryInvalidationKeys } from "../queryKeys"
+import { allInvalidationKey, exactKey, prefixKey } from "../queryKeys"
+import { queryInvalidationKeys } from "../invalidation"
 
 it.effect("queryInvalidationKeys includes exact, prefixes, and all", () =>
   Effect.sync(() => {
@@ -12,4 +13,3 @@ it.effect("queryInvalidationKeys includes exact, prefixes, and all", () =>
     expect(keys).toContain(prefixKey(["todos", 1]))
   })
 )
-

@@ -15,11 +15,3 @@ export const exactKey = (key: QueryKey): InvalidationKey => `${exactPrefix}${has
 export const prefixKey = (prefix: QueryKey): InvalidationKey => `${prefixPrefix}${hashQueryKey(prefix)}`
 
 export const allInvalidationKey: InvalidationKey = allKey
-
-export const queryInvalidationKeys = (key: QueryKey): ReadonlyArray<InvalidationKey> => {
-  const keys: Array<InvalidationKey> = [allInvalidationKey, exactKey(key)]
-  for (let i = 1; i <= key.length; i++) {
-    keys.push(prefixKey(key.slice(0, i)))
-  }
-  return keys
-}

@@ -39,7 +39,8 @@ describe("Atom-first surface", () => {
     const queryAtom = EffectQuery.queryAtom({
       queryKey: ["todos", 1],
       effect: Effect.promise<number>(() => new Promise((resolve) => setTimeout(() => resolve(++n), 10))),
-      staleTime: Infinity
+      staleTime: Infinity,
+      tags: [{ tag: "todos" }]
     })
 
     const derivedAtom = Atom.map(queryAtom, (result) =>
@@ -49,7 +50,7 @@ describe("Atom-first surface", () => {
     const mutationAtom = EffectQuery.mutationAtom({
       mutationKey: ["bump"],
       mutationFn: () => Effect.promise<void>(() => new Promise((resolve) => setTimeout(resolve, 1))),
-      invalidate: ["todos"]
+      invalidate: { _tag: "Tag", tag: "todos" }
     })
 
     function Demo() {
