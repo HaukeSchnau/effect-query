@@ -16,7 +16,7 @@ import * as Schedule from "effect/Schedule"
 
 import { QueryContext } from "./QueryContext"
 import { QueryClient, type QueryClientService } from "./QueryClient"
-import { allInvalidationKey, exactKey, prefixKey, queryInvalidationKeys, type QueryKey } from "./queryKeys"
+import { allInvalidationKey, exactKey, hashQueryKey, prefixKey, queryInvalidationKeys, type QueryKey } from "./queryKeys"
 
 export type QueryStatus = "idle" | "loading" | "success" | "error"
 
@@ -86,6 +86,7 @@ export interface UseMutationOptions<Arg, A, E, R> {
   readonly mutationKey?: QueryKey | undefined
   readonly mutationFn: (arg: Arg) => Effect.Effect<A, E, R | QueryClient | Reactivity>
   readonly invalidate?: ReadonlyArray<QueryKey> | QueryKey | undefined
+  readonly reactivityKeys?: ReadonlyArray<unknown> | Record<string, ReadonlyArray<unknown>> | undefined
 }
 
 export interface UseMutationResult<Arg, A, E> {
@@ -109,6 +110,11 @@ export interface EffectQuery<R> {
     readonly children?: React.ReactNode | undefined
     readonly defaultGcTime?: Duration.DurationInput | undefined
   }>
+  readonly queryAtom: <A, E>(options: UseQueryOptions<A, E, R>) => Atom.Atom<AtomResult.Result<A, E>>
+  readonly mutationAtom: <Arg, A, E>(options: UseMutationOptions<Arg, A, E, R>) => Atom.Writable<
+    AtomResult.Result<A, E>,
+    Arg
+  >
   readonly useQuery: <A, E>(options: UseQueryOptions<A, E, R>) => UseQueryResult<A, E>
   readonly useSuspenseQuery: <A, E>(options: UseSuspenseQueryOptions<A, E, R>) => UseSuspenseQueryResult<A>
   readonly useMutation: <Arg, A, E>(options: UseMutationOptions<Arg, A, E, R>) => UseMutationResult<Arg, A, E>
@@ -120,6 +126,10 @@ type QueryClientContextValue<R> = {
   readonly getQueryAtom: <A, E>(options: UseQueryOptions<A, E, R>) => Atom.Atom<AtomResult.Result<A, E>>
   readonly invalidate: Atom.Writable<AtomResult.Result<void, never>, ReadonlyArray<string>>
   readonly queryClient: QueryClientService
+  readonly getMutationAtom: <Arg, A, E>(options: UseMutationOptions<Arg, A, E, R>) => Atom.Writable<
+    AtomResult.Result<A, E>,
+    Arg
+  >
 }
 
 const QueryClientContext = React.createContext<QueryClientContextValue<any> | null>(null)
@@ -182,6 +192,7 @@ export const createEffectQuery = <R,>(options: {
 
   const createClientValue = (): QueryClientContextValue<R> => {
     const queryAtoms = new Map<string, Atom.Atom<AtomResult.Result<any, any>>>()
+    const mutationAtoms = new Map<string, Atom.Writable<AtomResult.Result<any, any>, any>>()
 
     let queryClientService!: QueryClientService
 
@@ -196,7 +207,7 @@ export const createEffectQuery = <R,>(options: {
       if (query.queryFn === undefined) {
         throw new Error("useQuery requires either `effect` or `queryFn`")
       }
-      return query.queryFn({ queryKey: query.queryKey }).pipe(
+        return query.queryFn({ queryKey: query.queryKey }).pipe(
         Effect.provideService(QueryContext, { queryKey: query.queryKey }),
         Effect.provideService(QueryClient, queryClientService)
       ) as Effect.Effect<A, E, R>
@@ -231,6 +242,37 @@ export const createEffectQuery = <R,>(options: {
 
       queryAtoms.set(keyHash, atom)
       return atom
+    }
+
+    const normalizeInvalidates = (value: UseMutationOptions<any, any, any, any>["invalidate"]): ReadonlyArray<QueryKey> => {
+      if (value === undefined) return []
+      if (Array.isArray(value) && value.length > 0 && (value as ReadonlyArray<any>).every(Array.isArray)) {
+        return value as ReadonlyArray<QueryKey>
+      }
+      return [value as QueryKey]
+    }
+
+    const getMutationAtom = <Arg, A, E>(mutation: UseMutationOptions<Arg, A, E, R>) => {
+      const keyHash = mutation.mutationKey ? `eq:m:${hashQueryKey(mutation.mutationKey)}` : undefined
+      if (keyHash !== undefined) {
+        const cached = mutationAtoms.get(keyHash) as Atom.Writable<AtomResult.Result<A, E>, Arg> | undefined
+        if (cached !== undefined) return cached
+      }
+
+      const invalidationKeys = normalizeInvalidates(mutation.invalidate).map(prefixKey)
+      const reactivityKeys = mutation.reactivityKeys ?? (invalidationKeys.length > 0 ? invalidationKeys : undefined)
+
+      const atom = runtime.fn(
+        Effect.fnUntraced(function*(arg: Arg) {
+          return yield* mutation.mutationFn(arg).pipe(Effect.provideService(QueryClient, queryClientService))
+        }),
+        reactivityKeys ? { reactivityKeys } : undefined
+      )
+
+      if (keyHash !== undefined) {
+        mutationAtoms.set(keyHash, atom as any)
+      }
+      return atom as Atom.Writable<AtomResult.Result<A, E>, Arg>
     }
 
     const awaitAtomComplete = <A, E>(registry: Registry.Registry, atom: Atom.Atom<AtomResult.Result<A, E>>) =>
@@ -291,15 +333,16 @@ export const createEffectQuery = <R,>(options: {
         })
     }
 
-    return { runtime, getQueryAtom, invalidate, queryClient: queryClientService }
+    return { runtime, getQueryAtom, invalidate, queryClient: queryClientService, getMutationAtom }
   }
 
+  const clientValue = createClientValue()
+
   const Provider: EffectQuery<R>["Provider"] = (props) => {
-    const client = React.useMemo(() => createClientValue(), [])
     const defaultIdleTTL = decodeMillis(props.defaultGcTime ?? "5 minutes", 5 * 60_000)
     return (
       <RegistryProvider defaultIdleTTL={defaultIdleTTL}>
-        <QueryClientContext.Provider value={client}>{props.children}</QueryClientContext.Provider>
+        <QueryClientContext.Provider value={clientValue}>{props.children}</QueryClientContext.Provider>
       </RegistryProvider>
     )
   }
@@ -396,33 +439,13 @@ export const createEffectQuery = <R,>(options: {
   const useMutation = <Arg, A, E>(mutation: UseMutationOptions<Arg, A, E, R>): UseMutationResult<Arg, A, E> => {
     const client = useClient()
 
-    const invalidationKeys = React.useMemo(() => {
-      const normalize = (value: UseMutationOptions<Arg, A, E, R>["invalidate"]): ReadonlyArray<QueryKey> => {
-        if (value === undefined) return []
-        if (Array.isArray(value) && value.length > 0 && (value as ReadonlyArray<any>).every(Array.isArray)) {
-          return value as ReadonlyArray<QueryKey>
-        }
-        return [value as QueryKey]
-      }
-
-      const invalidates = normalize(mutation.invalidate)
-
-      const keys: Array<string> = []
-      for (const key of invalidates) {
-        keys.push(prefixKey(key))
-      }
-      return keys
-    }, [mutation.invalidate])
-
+    const mutationKeySig = React.useMemo(
+      () => (mutation.mutationKey ? `eq:m:${hashQueryKey(mutation.mutationKey)}` : ""),
+      [mutation.mutationKey]
+    )
     const mutationAtom = React.useMemo(
-      () =>
-        client.runtime.fn(
-          Effect.fnUntraced(function*(arg: any) {
-            return yield* mutation.mutationFn(arg as Arg).pipe(Effect.provideService(QueryClient, client.queryClient))
-          }),
-          invalidationKeys.length > 0 ? { reactivityKeys: invalidationKeys } : undefined
-        ),
-      [client.queryClient, client.runtime, invalidationKeys, mutation.mutationFn]
+      () => client.getMutationAtom(mutation),
+      [client, mutationKeySig, mutation.invalidate, mutation.mutationFn, mutation.reactivityKeys]
     )
 
     const run = useAtomSet(mutationAtom, { mode: "promiseExit" })
@@ -565,5 +588,8 @@ export const createEffectQuery = <R,>(options: {
     }
   }
 
-  return { Provider, useQuery, useSuspenseQuery, useMutation, useQueryClient }
+  const queryAtom = <A, E>(options: UseQueryOptions<A, E, R>) => clientValue.getQueryAtom(options)
+  const mutationAtom = <Arg, A, E>(options: UseMutationOptions<Arg, A, E, R>) => clientValue.getMutationAtom(options)
+
+  return { Provider, queryAtom, mutationAtom, useQuery, useSuspenseQuery, useMutation, useQueryClient }
 }

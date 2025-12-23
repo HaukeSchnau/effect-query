@@ -1,4 +1,5 @@
-import { Result } from "@effect-atom/atom-react"
+import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import * as Atom from "@effect-atom/atom/Atom"
 import { Effect, Ref } from "effect"
 import * as Cause from "effect/Cause"
 import * as Option from "effect/Option"
@@ -55,6 +56,8 @@ export default function App() {
         <PollingExample />
         <div style={{ height: 16 }} />
         <RetryExample />
+        <div style={{ height: 16 }} />
+        <AtomFirstExample />
       </div>
     </EffectQuery.Provider>
   )
@@ -314,6 +317,65 @@ function RetryExample() {
         >
           Reset attempts + run
         </button>
+      </div>
+    </div>
+  )
+}
+
+function AtomFirstExample() {
+  const counterQueryAtom = React.useMemo(
+    () =>
+      EffectQuery.queryAtom({
+        queryKey: ["counter", "atom-first"],
+        effect: Effect.gen(function*() {
+          const api = yield* CounterApi
+          return yield* api.get
+        }),
+        staleTime: "1 second",
+        refetch: Schedule.spaced("3 seconds")
+      }),
+    []
+  )
+
+  const counterValueAtom = React.useMemo(
+    () => Atom.map(counterQueryAtom, (r) => (r._tag === "Success" ? r.value : 0)),
+    [counterQueryAtom]
+  )
+
+  const bumpAtom = React.useMemo(
+    () =>
+      EffectQuery.mutationAtom({
+        mutationKey: ["counter", "atom-first", "bump"],
+        mutationFn: () =>
+          Effect.gen(function*() {
+            const api = yield* CounterApi
+            return yield* api.increment
+          }),
+        invalidate: ["counter"]
+      }),
+    []
+  )
+
+  const value = useAtomValue(counterValueAtom)
+  const bump = useAtomSet(bumpAtom, { mode: "promiseExit" })
+  const client = EffectQuery.useQueryClient()
+
+  return (
+    <div className="card" style={{ textAlign: "left" }}>
+      <h2 style={{ marginTop: 0 }}>Atom-First Composition</h2>
+      <p style={{ marginTop: 0, opacity: 0.8 }}>
+        Uses <code>EffectQuery.queryAtom</code> + <code>Atom.map</code> +{" "}
+        <code>EffectQuery.mutationAtom</code> directly (hooks become thin wrappers).
+      </p>
+      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        <div style={{ fontSize: 24, fontWeight: 700, minWidth: 80 }}>{value}</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => void bump(void 0)}>+1 (mutationAtom)</button>
+          <button onClick={() => client.invalidateQueries(["counter"])}>Invalidate ["counter"]</button>
+        </div>
+      </div>
+      <div style={{ marginTop: 8, opacity: 0.75, fontSize: 12 }}>
+        This query also polls via <code>refetch: Schedule.spaced("3 seconds")</code>.
       </div>
     </div>
   )
