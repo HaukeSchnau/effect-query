@@ -14,6 +14,7 @@ import * as Fiber from "effect/Fiber"
 import type * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
+import * as Scope from "effect/Scope"
 
 import { QueryContext } from "./QueryContext"
 import { QueryClient, type QueryClientService } from "./QueryClient"
@@ -39,6 +40,11 @@ type UseQueryBaseOptions<A, E> = {
   readonly staleTime?: Duration.DurationInput | undefined
   readonly gcTime?: Duration.DurationInput | undefined
   /**
+   * Marks the query as resource-scoped. When `true` and `gcTime` is not provided,
+   * the query is configured to be GC'd immediately after the last observer unmounts.
+   */
+  readonly scoped?: boolean | undefined
+  /**
    * Extra invalidation tags for this query (in addition to its queryKey exact/prefix keys).
    */
   readonly tags?: ReadonlyArray<QueryTag> | undefined
@@ -60,18 +66,28 @@ type UseQueryBaseOptions<A, E> = {
 
 type UseQueryEffectOptions<A, E, R> = {
   readonly effect: Effect.Effect<A, E, R | QueryContext | QueryClient | Reactivity>
+  readonly scopedEffect?: never
+  readonly queryFn?: never
+}
+
+type UseQueryScopedEffectOptions<A, E, R> = {
+  readonly effect?: never
+  readonly scopedEffect: Effect.Effect<A, E, Scope.Scope | R | QueryContext | QueryClient | Reactivity>
   readonly queryFn?: never
 }
 
 type UseQueryFnOptions<A, E, R> = {
   readonly effect?: never
+  readonly scopedEffect?: never
   /**
    * Compatibility API: a function that receives the queryKey.
    */
   readonly queryFn: (options: { readonly queryKey: QueryKey }) => Effect.Effect<A, E, R>
 }
 
-export type UseQueryOptions<A, E, R> = UseQueryBaseOptions<A, E> & (UseQueryEffectOptions<A, E, R> | UseQueryFnOptions<A, E, R>)
+export type UseQueryOptions<A, E, R> =
+  & UseQueryBaseOptions<A, E>
+  & (UseQueryEffectOptions<A, E, R> | UseQueryScopedEffectOptions<A, E, R> | UseQueryFnOptions<A, E, R>)
 
 export interface UseQueryResult<A, E> {
   readonly result: AtomResult.Result<A, E>
@@ -151,6 +167,8 @@ export interface EffectQuery<R> {
   readonly Provider: React.FC<{
     readonly children?: React.ReactNode | undefined
     readonly defaultGcTime?: Duration.DurationInput | undefined
+    readonly scheduleTask?: ((f: () => void) => void) | undefined
+    readonly timeoutResolution?: number | undefined
   }>
   readonly queryAtom: <A, E>(options: UseQueryOptions<A, E, R>) => Atom.Atom<AtomResult.Result<A, E>>
   readonly mutationAtom: <Arg, A, E>(options: UseMutationOptions<Arg, A, E, R>) => Atom.Writable<
@@ -257,8 +275,19 @@ export const createEffectQuery = <R,>(options: {
 
     const toEffect = <A, E>(query: UseQueryOptions<A, E, R>): Effect.Effect<A, E, R> => {
       const effect = (query as any).effect as Effect.Effect<A, E, R | QueryContext | QueryClient> | undefined
+      const scopedEffect = (query as any).scopedEffect as Effect.Effect<
+        A,
+        E,
+        Scope.Scope | R | QueryContext | QueryClient
+      > | undefined
       if (effect !== undefined) {
         return effect.pipe(
+          Effect.provideService(QueryContext, { queryKey: query.queryKey }),
+          Effect.provideService(QueryClient, queryClientService)
+        ) as Effect.Effect<A, E, R>
+      }
+      if (scopedEffect !== undefined) {
+        return scopedEffect.pipe(
           Effect.provideService(QueryContext, { queryKey: query.queryKey }),
           Effect.provideService(QueryClient, queryClientService)
         ) as Effect.Effect<A, E, R>
@@ -266,7 +295,7 @@ export const createEffectQuery = <R,>(options: {
       if (query.queryFn === undefined) {
         throw new Error("useQuery requires either `effect` or `queryFn`")
       }
-        return query.queryFn({ queryKey: query.queryKey }).pipe(
+      return query.queryFn({ queryKey: query.queryKey }).pipe(
         Effect.provideService(QueryContext, { queryKey: query.queryKey }),
         Effect.provideService(QueryClient, queryClientService)
       ) as Effect.Effect<A, E, R>
@@ -295,7 +324,7 @@ export const createEffectQuery = <R,>(options: {
       }).pipe(
         Atom.withReactivity(queryInvalidationKeys(query.queryKey, query.tags)),
         query.gcTime === undefined
-          ? Atom.setIdleTTL("5 minutes")
+          ? (query.scoped ? Atom.setIdleTTL("0 millis") : Atom.setIdleTTL("5 minutes"))
           : Atom.setIdleTTL(query.gcTime)
       )
 
@@ -393,7 +422,11 @@ export const createEffectQuery = <R,>(options: {
   const Provider: EffectQuery<R>["Provider"] = (props) => {
     const defaultIdleTTL = decodeMillis(props.defaultGcTime ?? "5 minutes", 5 * 60_000)
     return (
-      <RegistryProvider defaultIdleTTL={defaultIdleTTL}>
+      <RegistryProvider
+        defaultIdleTTL={defaultIdleTTL}
+        scheduleTask={props.scheduleTask}
+        timeoutResolution={props.timeoutResolution}
+      >
         <QueryClientContext.Provider value={clientValue}>{props.children}</QueryClientContext.Provider>
       </RegistryProvider>
     )

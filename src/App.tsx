@@ -9,6 +9,9 @@ import * as Schedule from "effect/Schedule"
 import { createEffectQuery, Invalidation, QueryClient, QueryContext } from "./effect-query"
 import "./App.css"
 
+let openScopedResources = 0
+let nextScopedId = 0
+
 class CounterApi extends Effect.Service<CounterApi>()("demo/CounterApi", {
   scoped: Effect.gen(function*() {
     const ref = yield* Ref.make(0)
@@ -63,6 +66,8 @@ export default function App() {
         <NonThrowingSuspenseExample />
         <div style={{ height: 16 }} />
         <ExitExample />
+        <div style={{ height: 16 }} />
+        <ScopedResourceExample />
       </div>
     </EffectQuery.Provider>
   )
@@ -460,4 +465,59 @@ function ExitExample() {
       </div>
     </div>
   )
+}
+
+function ScopedResourceExample() {
+  const [show, setShow] = React.useState(false)
+  const [open, setOpen] = React.useState(openScopedResources)
+
+  React.useEffect(() => {
+    const id = window.setInterval(() => setOpen(openScopedResources), 100)
+    return () => window.clearInterval(id)
+  }, [])
+
+  return (
+    <div className="card" style={{ textAlign: "left" }}>
+      <h2 style={{ marginTop: 0 }}>Scoped / Resource-Safe Query</h2>
+      <p style={{ marginTop: 0, opacity: 0.8 }}>
+        Uses <code>scopedEffect</code> + <code>scoped: true</code> so resources are released when the last observer
+        unmounts (defaults to <code>gcTime: "0 millis"</code> for scoped queries).
+      </p>
+      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ opacity: 0.75, fontSize: 12 }}>open resources: {open}</div>
+          {show ? <ScopedResourceConsumer /> : <div style={{ opacity: 0.7 }}>Not mounted</div>}
+        </div>
+        <button onClick={() => setShow((s) => !s)}>{show ? "Unmount" : "Mount"}</button>
+      </div>
+    </div>
+  )
+}
+
+function ScopedResourceConsumer() {
+  const query = EffectQuery.useQuery({
+    queryKey: ["scoped", "resource"],
+    scoped: true,
+    staleTime: Infinity,
+    scopedEffect: Effect.acquireRelease(
+      Effect.sync(() => {
+        openScopedResources++
+        return ++nextScopedId
+      }),
+      () =>
+        Effect.sync(() => {
+          openScopedResources--
+        })
+    ).pipe(Effect.map((id) => ({ id })))
+  })
+
+  return Result.builder(query.result)
+    .onInitial(() => <div>Opening…</div>)
+    .onSuccess((value: { readonly id: number }, { waiting }: { readonly waiting: boolean }) => (
+      <div>
+        <div style={{ fontWeight: 700 }}>resource id: {value.id}</div>
+        <div style={{ opacity: 0.7, fontSize: 12 }}>{waiting ? "Refreshing…" : "Active"}</div>
+      </div>
+    ))
+    .render()
 }
